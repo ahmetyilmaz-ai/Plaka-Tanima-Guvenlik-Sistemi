@@ -4,7 +4,6 @@
 
 ---
 
-![Sertifika](images/sertifika.png)
 
 # Araç Plaka Tanıma ve Güvenlik Sistemi
 
