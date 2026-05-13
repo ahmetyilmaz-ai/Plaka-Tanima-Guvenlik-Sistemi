@@ -14,7 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ultralytics import YOLO
 import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoProcessor, Florence2ForConditionalGeneration
 from PIL import Image
 
 # Gelişmiş plaka OCR modülü
@@ -71,61 +71,109 @@ def plaka_oku_coklu_deneme(plate_img):
 
 def vlm_ile_arac_analizi(image_path, arac_tipi):
     """
-    BLIP modeli kullanarak araç hakkında görsel analiz yapar
-    Rengi, markası ve durumu hakkında bilgi döndürür - GPU destekli
+    Florence-2 modeli ile araç hakkında görsel analiz yapar.
+    BLIP yerine daha güncel prompt tabanlı VLM kullanılır.
     """
     global vlm_processor, vlm_model
 
     try:
         if 'vlm_processor' not in globals():
-            logger.info(f"VLM modeli yükleniyor (GPU: {USE_GPU})...")
-            vlm_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-            vlm_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large")
+            logger.info(f"Florence-2 modeli yükleniyor (GPU: {USE_GPU})...")
+
+            model_id = "florence-community/Florence-2-base"
+
+            vlm_processor = AutoProcessor.from_pretrained(model_id)
+            vlm_model = Florence2ForConditionalGeneration.from_pretrained(model_id)
+
             vlm_model.to(DEVICE)
             vlm_model.eval()
-            logger.info(f"VLM modeli yüklendi (device: {DEVICE})")
 
-        image = Image.open(image_path).convert('RGB')
-        inputs = vlm_processor(image, return_tensors="pt").to(DEVICE)
+            logger.info(f"Florence-2 modeli yüklendi (device: {DEVICE})")
+
+        image = Image.open(image_path).convert("RGB")
+
+        # Florence-2 prompt tabanlı çalışır.
+        # <CAPTION> kısa açıklama, <DETAILED_CAPTION> daha detaylı açıklama üretir.
+        task_prompt = "<DETAILED_CAPTION>"
+
+        inputs = vlm_processor(
+            text=task_prompt,
+            images=image,
+            return_tensors="pt"
+        ).to(DEVICE)
 
         with torch.no_grad():
-            out = vlm_model.generate(**inputs, max_length=50)
+            generated_ids = vlm_model.generate(
+                **inputs,
+                max_new_tokens=80,
+                num_beams=3
+            )
 
-        caption = vlm_processor.decode(out[0], skip_special_tokens=True)
-        logger.info(f"VLM Caption: {caption}")
+        generated_text = vlm_processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=False
+        )[0]
 
-        # Caption'dan araç bilgilerini çıkar
-        yorum = caption
+        parsed = vlm_processor.post_process_generation(
+            generated_text,
+            task=task_prompt,
+            image_size=image.size
+        )
 
-        # Renk tespiti
-        renkler = ['white', 'black', 'red', 'blue', 'green', 'yellow', 'gray', 'silver']
+        caption = parsed.get(task_prompt, generated_text)
+
+        logger.info(f"Florence-2 Caption: {caption}")
+
+        # Caption'dan basit araç bilgisi çıkarma
+        renkler = {
+            "white": "WHITE",
+            "black": "BLACK",
+            "red": "RED",
+            "blue": "BLUE",
+            "green": "GREEN",
+            "yellow": "YELLOW",
+            "gray": "GRAY",
+            "grey": "GRAY",
+            "silver": "SILVER"
+        }
+
         renk = "UNKNOWN"
-        for r in renkler:
-            if r.lower() in caption.lower():
-                renk = r.upper()
+        caption_lower = caption.lower()
+
+        for key, value in renkler.items():
+            if key in caption_lower:
+                renk = value
                 break
 
-        # Marka tespiti (basit)
-        markalar = ['toyota', 'bmw', 'mercedes', 'audi', 'volkswagen', 'fiat', 'renault',
-                    'honda', 'hyundai', 'ford', 'peugeot', 'citroen']
+        markalar = [
+            "toyota", "bmw", "mercedes", "audi", "volkswagen",
+            "fiat", "renault", "honda", "hyundai", "ford",
+            "peugeot", "citroen"
+        ]
+
         marka = "UNKNOWN"
+
         for m in markalar:
-            if m in caption.lower():
+            if m in caption_lower:
                 marka = m.upper()
                 break
 
-        # Durum tespiti
-        durum = "PARKED" if 'parked' in caption.lower() else "MOVING"
+        if "parked" in caption_lower or "stationary" in caption_lower:
+            durum = "PARKED"
+        elif "moving" in caption_lower or "driving" in caption_lower:
+            durum = "MOVING"
+        else:
+            durum = "UNKNOWN"
 
         yorum = f"{renk} {marka} {arac_tipi} ({durum})"
-        logger.info(f"VLM Comment: {yorum}")
+
+        logger.info(f"Florence-2 Comment: {yorum}")
 
         return yorum
 
     except Exception as e:
-        logger.error(f"VLM hatası: {e}")
-        return "VLM ANALYSIS FAILED"
-
+        logger.error(f"Florence-2 hatası: {e}")
+        return "FLORENCE-2 ANALYSIS FAILED"
 
 # ==================== GÖRSELLEŞTİRME ====================
 
@@ -237,7 +285,7 @@ def main():
     logger.info("Modeller yükleniyor...")
 
     # COCO modeli (araç tespiti için)
-    coco_model = YOLO('yolov8n.pt')
+    coco_model = YOLO('yolo11n.pt')
     logger.info("COCO modeli yüklendi")
 
     # Plaka tespit modeli (varsa)

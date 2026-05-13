@@ -70,8 +70,8 @@ def load_models():
     from ultralytics import YOLO
 
     with st.spinner("Loading models..."):
-        coco_model = YOLO('yolov8n.pt')
-        # The other models (EasyOCR, BLIP) are loaded inside their respective functions
+        coco_model = YOLO('yolo11n.pt')
+        # The other models (OCR, Florence-2) are loaded inside their respective functions
     return coco_model
 
 def process_image_logic(image, models):
