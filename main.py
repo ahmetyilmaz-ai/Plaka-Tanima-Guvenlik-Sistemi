@@ -13,10 +13,12 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from ultralytics import YOLO
-import easyocr
 import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from PIL import Image
+
+# Gelişmiş plaka OCR modülü
+from plate_ocr import read_plate, get_ocr_instance
 
 # UTF-8 encoding için Windows düzeltmesi
 if sys.platform == 'win32':
@@ -52,97 +54,17 @@ import database as db
 
 # ==================== PLAKA OKUMA FONKSİYONLARI ====================
 
-def format_plate_text(text):
-    """
-    Validates and formats a license plate string to a generic format.
-    A valid plate is an alphanumeric string between 4 and 10 characters.
-    """
-    if not text:
-        return None
-
-    clean_text = ''.join(filter(str.isalnum, text)).upper()
-
-    if 4 <= len(clean_text) <= 10:
-        return clean_text
-
-    return None
-
-
 def plaka_oku_coklu_deneme(plate_img):
     """
-    Plaka görüntüsünü farklı ön işleme yöntemleri ile okur
-    En iyi sonucu döndürür - GPU destekli
+    Plaka görüntüsünü gelişmiş çoklu-stratejili OCR ile okur
+    MMOCR + EasyOCR + Tesseract kombinasyonu kullanır
     """
-    global ocr_reader
-    if 'ocr_reader' not in globals():
-        logger.info(f"EasyOCR yükleniyor (GPU: {USE_GPU})...")
-        ocr_reader = easyocr.Reader(['en', 'tr'], gpu=USE_GPU)
-        logger.info("EasyOCR yüklendi")
-
-    adaylar = []
-
-    h, w = plate_img.shape[:2]
-    if h < 50 or w < 100:
-        scale = max(3.0, 150 / w)
-        plate_img = cv2.resize(plate_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    if len(plate_img.shape) == 3:
-        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = plate_img
-
-    islenmis_gorseller = [gray]
-
-    # 1. Adaptive Thresholding
-    adaptive_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    islenmis_gorseller.append(adaptive_thresh)
-    islenmis_gorseller.append(cv2.bitwise_not(adaptive_thresh))
-
-    # 2. Dilation and Erosion
-    kernel = np.ones((2, 2), np.uint8)
-    dilated = cv2.dilate(gray, kernel, iterations=1)
-    eroded = cv2.erode(dilated, kernel, iterations=1)
-    islenmis_gorseller.append(dilated)
-    islenmis_gorseller.append(eroded)
-
-    for img in islenmis_gorseller:
-        try:
-            sonuc = ocr_reader.readtext(
-                img,
-                allowlist='0123456789ABCDEFGHJKLMNPRSTUVWXYZ',
-                detail=1,
-                paragraph=False,
-                width_ths=0.8,
-                height_ths=0.8,
-                decoder='beamsearch',
-                contrast_ths=0.4,
-                adjust_contrast=0.5
-            )
-
-            for bbox, text, prob in sonuc:
-                if prob > 0.4:
-                    text = text.upper().replace('O', '0').replace('I', '1').replace('S', '5').replace('L', '1')
-                    temiz_text = ''.join(c for c in text if c.isalnum())
-                    formatted_plate = format_plate_text(temiz_text)
-                    if formatted_plate:
-                        adaylar.append((formatted_plate, prob))
-        except Exception as e:
-            continue
-
-    if adaylar:
-        from collections import defaultdict
-        oy_plakalar = defaultdict(list)
-        for plaka, prob in adaylar:
-            oy_plakalar[plaka].append(prob)
-
-        en_iyi_plaka = max(oy_plakalar.items(), key=lambda x: (len(x[1]), sum(x[1])))
-        ortalama_prob = sum(en_iyi_plaka[1]) / len(en_iyi_plaka[1])
-
-        logger.info(f"Plaka okundu: {en_iyi_plaka[0]} (güven: {ortalama_prob:.2f})")
-        return en_iyi_plaka[0]
-
-    logger.warning("Plaka okunamadı")
-    return "OKUNAMADI"
+    try:
+        result = read_plate(plate_img, use_gpu=USE_GPU)
+        return result
+    except Exception as e:
+        logger.error(f"Plaka okuma hatası: {e}")
+        return "OKUNAMADI"
 
 
 # ==================== VLM FONKSİYONLARI ====================
@@ -157,8 +79,8 @@ def vlm_ile_arac_analizi(image_path, arac_tipi):
     try:
         if 'vlm_processor' not in globals():
             logger.info(f"VLM modeli yükleniyor (GPU: {USE_GPU})...")
-            vlm_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            vlm_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+            vlm_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+            vlm_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large")
             vlm_model.to(DEVICE)
             vlm_model.eval()
             logger.info(f"VLM modeli yüklendi (device: {DEVICE})")
@@ -306,6 +228,11 @@ def main():
     # 1. Veritabanını hazırla
     db.init_database()
 
+    # 1.5. Gelişmiş OCR sistemini önceden yükle
+    logger.info("Gelişmiş OCR sistemi başlatılıyor...")
+    get_ocr_instance(use_gpu=USE_GPU)
+    logger.info("OCR sistemi hazır")
+
     # 2. Modelleri yükle
     logger.info("Modeller yükleniyor...")
 
@@ -314,11 +241,16 @@ def main():
     logger.info("COCO modeli yüklendi")
 
     # Plaka tespit modeli (varsa)
-    plaka_model_path = PROJECT_ROOT / "models" / "license_plate_detector.pt"
+    new_plaka_model_path = PROJECT_ROOT / "models" / "license_plate_detector_v2.pt"
+    old_plaka_model_path = PROJECT_ROOT / "models" / "license_plate_detector.pt"
     plaka_model = None
-    if plaka_model_path.exists():
-        plaka_model = YOLO(str(plaka_model_path))
-        logger.info("Plaka tespit modeli yüklendi")
+
+    if new_plaka_model_path.exists():
+        plaka_model = YOLO(str(new_plaka_model_path))
+        logger.info("Yeni plaka tespit modeli yüklendi")
+    elif old_plaka_model_path.exists():
+        plaka_model = YOLO(str(old_plaka_model_path))
+        logger.info("Eski plaka tespit modeli yüklendi")
     else:
         logger.warning("Plaka tespit modeli bulunamadı, COCO modeli kullanılacak")
 
